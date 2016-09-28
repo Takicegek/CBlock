@@ -46,7 +46,8 @@ class Peer:
     def makeFriends(self):
         fP = list(self.friendPeers) 
         for friend in fP:
-            self.sendRequest(['REQUEST_FRIENDS'], friend)
+            request = self.prepareRequest(['REQUEST_FRIENDS'])
+            self.sendDataToTarget(request, friend)
         return True
         
     def addFriends(self, friendList):
@@ -55,7 +56,7 @@ class Peer:
                 self.friendPeers.append(friend)
         return True
     
-    def sendRequest(self, request, target):
+    def prepareRequest(self, request):
         #Sends a signed request..
         #target is a tuple containing target and port.
         signer = self.privateKey.signer(padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH), hashes.SHA256())
@@ -63,19 +64,21 @@ class Peer:
         digitalSignature = signer.finalize()
         data = request + [self.publicKey.public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo), unicode(digitalSignature), time.time(), unicode(hashlib.sha512(json.dumps(request)).hexdigest())]
         data = json.dumps(data)
+        return data
+        
+    def sendDataToTarget(self, data, target):
+        #Returns the socket for further use. Sends data from argument as is.
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.connect(target)
         sock.send(data)
+        return sock
         
     def sendRequestOnSocket(self, request, sock):
         #Sends a signed request..
         #target is a tuple containing target and port.
-        signer = self.privateKey.signer(padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH), hashes.SHA256())
-        signer.update(json.dumps(request))
-        digitalSignature = signer.finalize()
-        data = request + [self.publicKey.public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo), unicode(digitalSignature), time.time(), unicode(hashlib.sha512(json.dumps(request)).hexdigest())]
-        data = json.dumps(data)
+        data = self.prepareRequest(request)
         sock.send(data)
+        return True
         
     def writeRequest(self, request, originPublicKey, digitalSignature, timestamp, requestHash):
         print "writeRequest"        
@@ -86,7 +89,11 @@ class Peer:
     def spreadEntry(self, dataHash):       
         for target in self.friendPeers:
             print "spreadEntry"
-            self.sendRequest(['AWARE_REQUEST', dataHash])
+            req = self.prepareRequest(['AWARE_REQUEST', dataHash])
+            sock = self.sendDataToTarget(req, target)
+            callback = clientConnection(sock, self)
+            callback.run()
+            #Define a limited idle lifetime for clientHandlers.
         return True
 
     def receive(self):
@@ -98,6 +105,7 @@ class PeerListener(Thread):
     serverSocket = None
     parentPeer = None
     #clientSockets = set([])
+    #passiveListener
     
     def __init__(self, parentPeer):
         Thread.__init__(self)
@@ -163,12 +171,9 @@ class PeerListener(Thread):
         return
         
     def askForEntry(self, clientSocket, dataHash):
-        textPublicKey = self.publicKey.public_bytes(encoding=serialization.Encoding.PEM, format=serialization.PublicFormat.SubjectPublicKeyInfo)
-        signer = self.privateKey.signer(padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH), hashes.SHA256())
-        signer.update(json.dumps(['ENTRY_REQUEST', dataHash]))
-        digitalSignature = signer.finalize()
-        reqHash = hashlib.sha512(json.dumps(['ENTRY_REQUEST', dataHash])).hexdigest()        
-        clientSocket.send(json.dumps(['ENTRY_REQUEST', dataHash, time.time(), textPublicKey, digitalSignature, reqHash]))
+        req = ['ENTRY_REQUEST', dataHash]
+        self.parentPeer.prepareRequest(req)
+        clientSocket.send(req)
         return True
         
     def respondSendingEntry(self, clientSocket, dataHash):
@@ -192,12 +197,52 @@ class PeerListener(Thread):
             if not self.checkRequest(request, originPublicKey, digitalSignature, timestamp, requestHash):
                 return False
             self.processRequest(clientSocket, request, originPublicKey, digitalSignature, timestamp, requestHash)
-        return True      
+        return True
+        
+class clientConnection(Thread):
+    sock = None
+    parentPeer = None    
+    
+    def __init__(self, sock, parentPeer):
+        self.sock = sock
+        self.parentPeer = parentPeer        
+        Thread.__init__(self)
 
+    def respondSendingEntry(self, clientSocket, dataHash):
+        request = self.parentPeer.entryList.get(dataHash)
+        if not request:
+            return False
+        self.parentPeer.sendRequestOnSocket(request, clientSocket)
+        self.stop()        
+        return True
+
+    def run(self):
+        while(True):
+            self.serverSocket.listen(10)
+            clientSocket, connection = self.serverSocket.accept()
+            data = json.loads(clientSocket.recv(2048))
+            print data
+            request = data[:-4]
+            originPublicKey = serialization.load_pem_public_key(str(data[-4]), backend=default_backend())
+            digitalSignature = data[-3]
+            timestamp = data[-2]
+            requestHash = data[-1]
+            if not self.checkRequest(request, originPublicKey, digitalSignature, timestamp, requestHash):
+                return False
+            self.processRequest(clientSocket, request, originPublicKey, digitalSignature, timestamp, requestHash)
+        return True
+        
+    def processRequest(self, clientSocket, request, originPublicKey, digitalSignature, timestamp, requestHash):
+        if request[0] == 'ENTRY_REQUEST':
+            self.respondSendingEntry(clientSocket, request[1])
+        return
+    
 class Entry:
     reqHash = None
     timestamp = None
     request = None
+    
+    #use entries instead of lists and add Entry.toRequest() and toEntry(data) functions
     
     def __init__(self, request, timestamp):
         self.timestamp = time.time()
